@@ -85,7 +85,7 @@ if [ -n "$PACKAGES" ]; then
   BINFMT_ENTRY=""
   for f in /proc/sys/fs/binfmt_misc/*; do
     if grep -q '^enabled' "$f" 2>/dev/null && \
-       grep -q '^interpreter .*qemu-aarch64-static' "$f" 2>/dev/null && \
+       grep -qE '^interpreter .*(qemu-aarch64-static|aarch64-binfmt-P)' "$f" 2>/dev/null
        grep -q '^flags:.*F' "$f" 2>/dev/null; then
       BINFMT_ENTRY=$f
       break

@@ -68,6 +68,11 @@ jobs:
           echo 'progress = dot:giga' > ~/.wgetrc   # wget-Fortschritt sonst zeilenweise im Log
           sudo update-binfmts --enable qemu-aarch64
 
+      - name: Enable QEMU binfmt
+        run: |
+          sudo systemctl restart systemd-binfmt.service
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+
       # Halium, Droidian (~2 GB), OrangeFox zwischenspeichern. Das 26.04-Rootfs
       # ändert sich täglich (neuer Dateiname), wird also bei Bedarf neu geladen.
       - name: Cache downloads
