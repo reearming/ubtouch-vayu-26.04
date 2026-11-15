@@ -21,7 +21,7 @@ on:
         type: boolean
         default: false
       additional_packages:
-        description: "packages to be installed into rootfs, separate then with colon (likeflatpak,fastfetch,clang,lldb)"
+        description: "packages to be installed into rootfs, separate them with colon (like flatpak,fastfetch,clang,lldb)"
         type: string
         default: ""
   # Tag pushen (git tag v26.04-1 && git push --tags) -> Build + Release

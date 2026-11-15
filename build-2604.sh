@@ -1443,7 +1443,7 @@ if [ "$MODE" != "--rootfs-only" ]; then
   step "Flashing boot, dtbo, vbmeta (bootloader fastboot)"
   fastboot flash boot boot.img
   fastboot flash dtbo dtbo.img
-  fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img
+  fastboot flash vbmeta vbmeta.img
 
   step "Rebooting to fastbootd to flash vendor (dynamic partition)"
   fastboot reboot fastboot
