@@ -2,16 +2,55 @@
 # Builds a complete Ubuntu Touch 26.04 (EARLY, daily channel) flash kit for the Xiaomi Poco X3 Pro (vayu).
 # Downloads everything that is needed, builds ubuntu.img without root (fakeroot + mke2fs -d).
 #
-#   ./build-2604.sh           -> ./vayu-ubuntu-touch-26.04-flashkit/
-#   ./build-2604.sh --pack    -> additionally vayu-ubuntu-touch-26.04-flashkit.tar.zst
+#   ./build-2604.sh                                  -> ./vayu-ubuntu-touch-26.04-flashkit/
+#   ./build-2604.sh --pack                           -> additionally creates a .tar.zst archive
+#   ./build-2604.sh --packages flatpak,xdg-desktop-portal        -> install extra ARM64 packages into the rootfs
 #
 # Needs: curl wget python3 unzip fakeroot e2fsprogs(>=1.43) xz-utils [zstd for --pack]
+# --packages additionally needs sudo, qemu-aarch64-static and an enabled qemu-aarch64 binfmt_misc entry (F flag).
 # Disk:  ~16 GB free during the build (downloads are cached in ./dl)
 set -e
 umask 022
 cd "$(dirname "$(readlink -f "$0")")"
 HERE=$PWD
-PACK=0; [ "$1" = "--pack" ] && PACK=1
+PACK=0
+PACKAGES=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --pack)
+      PACK=1
+      ;;
+    --packages)
+      [ "$#" -ge 2 ] || { echo "usage: $0 [--pack] [--packages pkg1,pkg2,...]"; exit 1; }
+      PACKAGES="${PACKAGES:+$PACKAGES,}$2"
+      shift
+      ;;
+    --packages=*)
+      PACKAGES="${PACKAGES:+$PACKAGES,}${1#--packages=}"
+      ;;
+    *)
+      echo "unknown argument: $1"
+      echo "usage: $0 [--pack] [--packages pkg1,pkg2,...]"
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+# Accept comma- or space-separated package names, but pass only validated names to apt.
+PACKAGES=${PACKAGES//,/ }
+if [ -n "$PACKAGES" ]; then
+  read -r -a PACKAGE_LIST <<< "$PACKAGES"
+  PACKAGES=""
+  for pkg in "${PACKAGE_LIST[@]}"; do
+    [[ "$pkg" =~ ^[a-zA-Z0-9][a-zA-Z0-9+.-]*(:arm64)?$ ]] || {
+      echo "invalid package name: $pkg"; exit 1;
+    }
+    PACKAGES="${PACKAGES:+$PACKAGES }$pkg"
+  done
+  echo "additional rootfs packages: $PACKAGES"
+fi
+export PACKAGES
 
 # 26.04-1.x is a hidden early-test channel (forums.ubports.com/topic/12312). vayu is not in it,
 # but the rootfs is generic: every android9plus device there ships the same rootfs tarball.
@@ -38,9 +77,72 @@ for t in curl wget python3 unzip fakeroot mke2fs xz sha256sum aarch64-linux-gnu-
   command -v $t >/dev/null || { echo "missing tool: $t"; exit 1; }
 done
 [ $PACK = 1 ] && { command -v zstd >/dev/null || { echo "missing tool: zstd"; exit 1; }; }
+if [ -n "$PACKAGES" ]; then
+  command -v sudo >/dev/null || { echo "--packages requires sudo"; exit 1; }
+  command -v qemu-aarch64-static >/dev/null || { echo "--packages requires qemu-aarch64-static"; exit 1; }
+  command -v mountpoint >/dev/null || { echo "--packages requires mountpoint (util-linux)"; exit 1; }
+  sudo -v
+  BINFMT_ENTRY=""
+  for f in /proc/sys/fs/binfmt_misc/*; do
+    if grep -q '^enabled' "$f" 2>/dev/null && \
+       grep -q '^interpreter .*qemu-aarch64-static' "$f" 2>/dev/null && \
+       grep -q '^flags:.*F' "$f" 2>/dev/null; then
+      BINFMT_ENTRY=$f
+      break
+    fi
+  done
+  [ -n "$BINFMT_ENTRY" ] || {
+    echo "--packages requires an enabled qemu-aarch64 binfmt_misc entry with the F flag."
+    echo "Install/configure qemu-user-static and make sure binfmt_misc is mounted and registered."
+    exit 1
+  }
+fi
 
 step() { echo; echo "==> $*"; }
-rm -rf stage $OUT $KIT; mkdir -p $OUT dl out
+
+# A previous --packages run may have left root-owned files in stage.
+# Try an ordinary removal first; use sudo only if permissions require it.
+remove_path() {
+  local path=$1
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+  if rm -rf -- "$path" 2>/dev/null; then
+    return 0
+  fi
+  command -v sudo >/dev/null || {
+    echo "cannot remove $path (root-owned files may remain); install sudo or remove it manually" >&2
+    return 1
+  }
+  sudo rm -rf -- "$path"
+}
+
+remove_stage() {
+  local root="$HERE/stage/system"
+  local name mp
+  if [ -d "$root" ]; then
+    for name in sys proc dev; do
+      mp="$root/$name"
+      if mountpoint -q "$mp"; then
+        command -v sudo >/dev/null || {
+          echo "stage contains a mounted filesystem ($mp); sudo is required to unmount it" >&2
+          return 1
+        }
+        sudo umount -R "$mp"
+      fi
+    done
+    for name in sys proc dev; do
+      mp="$root/$name"
+      if mountpoint -q "$mp"; then
+        echo "refusing to remove stage: $mp is still mounted" >&2
+        return 1
+      fi
+    done
+  fi
+  remove_path stage
+}
+
+rm -rf -- "$OUT" "$KIT"
+remove_stage
+mkdir -p "$OUT" dl out
 
 # ---------------------------------------------------------------- downloads
 # Kernel 4.14.221-perf+: run kernel/build-kernel.sh first, it puts its device tarball into out/.
@@ -308,7 +410,66 @@ aarch64-linux-gnu-gcc -shared -fPIC -O2 -o dl/libvayu-lal-compat.so "$HERE/fixes
 # Settings "Brightness & Display" fix: see fixes/elf-weaken-undef.py
 cp "$HERE/fixes/elf-weaken-undef.py" dl/elf-weaken-undef.py
 LIST="dl/$(basename $ROOTFS) dl/halium_halium_arm64.tar.xz out/device_vayu_usrmerge.tar.xz dl/version.tar.xz"
-fakeroot -- bash -ec '
+FAKEROOT_STATE="$HERE/.fakeroot-state-$$"
+ROOTFS_DIR="$HERE/stage/system"
+RESOLV_TMP=""
+RESOLV_SAVED=0
+POLICY_SAVED=0
+PACKAGE_CHROOT_ACTIVE=0
+
+cleanup_package_chroot() {
+  [ "$PACKAGE_CHROOT_ACTIVE" = 1 ] || return 0
+
+  local status=0
+  # Unmount only mountpoints that were actually mounted, in reverse order.
+  if mountpoint -q "$ROOTFS_DIR/sys"; then
+    sudo umount "$ROOTFS_DIR/sys" || status=1
+  fi
+  if mountpoint -q "$ROOTFS_DIR/proc"; then
+    sudo umount "$ROOTFS_DIR/proc" || status=1
+  fi
+  if mountpoint -q "$ROOTFS_DIR/dev"; then
+    sudo umount -R "$ROOTFS_DIR/dev" || status=1
+  fi
+
+  # Never restore files or remove stage while a chroot mount is still active.
+  if mountpoint -q "$ROOTFS_DIR/sys" ||
+     mountpoint -q "$ROOTFS_DIR/proc" ||
+     mountpoint -q "$ROOTFS_DIR/dev"; then
+    echo "ERROR: chroot filesystems are still mounted; leaving temporary files in place." >&2
+    return 1
+  fi
+  [ "$status" = 0 ] || {
+    echo "ERROR: failed to unmount one or more chroot filesystems." >&2
+    return 1
+  }
+
+  sudo rm -f -- "$ROOTFS_DIR/etc/resolv.conf"
+  if [ "$RESOLV_SAVED" = 1 ]; then
+    sudo cp -a -- "$RESOLV_TMP/resolv.conf" "$ROOTFS_DIR/etc/resolv.conf"
+  fi
+  sudo rm -f -- "$ROOTFS_DIR/usr/sbin/policy-rc.d"
+  if [ "$POLICY_SAVED" = 1 ]; then
+    sudo cp -a -- "$RESOLV_TMP/policy-rc.d" "$ROOTFS_DIR/usr/sbin/policy-rc.d"
+  fi
+
+  rm -rf -- "$RESOLV_TMP"
+  RESOLV_TMP=""
+  PACKAGE_CHROOT_ACTIVE=0
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [ "$PACKAGE_CHROOT_ACTIVE" = 1 ]; then
+    cleanup_package_chroot || rc=1
+  fi
+  rm -f -- "$FAKEROOT_STATE"
+  exit "$rc"
+}
+trap on_exit EXIT
+
+fakeroot -s "$FAKEROOT_STATE" -- bash -ec '
 umask 022
 mkdir -p stage; cd stage
 first=1
@@ -324,6 +485,53 @@ for f in '"$LIST"'; do
     done
   fi
 done
+'
+
+# Install optional packages outside fakeroot: sudo/chroot must see the real caller UID.
+# The saved fakeroot database preserves ownership metadata from rootfs extraction.
+if [ -n "$PACKAGES" ]; then
+  step "Installing additional ARM64 packages in the rootfs"
+  RESOLV_TMP=$(mktemp -d)
+  if [ -e "$ROOTFS_DIR/etc/resolv.conf" ] || [ -L "$ROOTFS_DIR/etc/resolv.conf" ]; then
+    cp -a "$ROOTFS_DIR/etc/resolv.conf" "$RESOLV_TMP/resolv.conf"
+    RESOLV_SAVED=1
+  fi
+  if [ -e "$ROOTFS_DIR/usr/sbin/policy-rc.d" ] || [ -L "$ROOTFS_DIR/usr/sbin/policy-rc.d" ]; then
+    cp -a "$ROOTFS_DIR/usr/sbin/policy-rc.d" "$RESOLV_TMP/policy-rc.d"
+    POLICY_SAVED=1
+  fi
+  PACKAGE_CHROOT_ACTIVE=1
+
+  # The chroot must resolve package mirrors but must not start services on the host.
+  sudo rm -f -- "$ROOTFS_DIR/etc/resolv.conf"
+  sudo cp -L /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
+  printf '#!/bin/sh\nexit 101\n' | sudo tee "$ROOTFS_DIR/usr/sbin/policy-rc.d" >/dev/null
+  sudo chmod 755 "$ROOTFS_DIR/usr/sbin/policy-rc.d"
+
+  sudo mount --rbind /dev "$ROOTFS_DIR/dev"
+  sudo mount --make-rslave "$ROOTFS_DIR/dev"
+  sudo mount -t proc proc "$ROOTFS_DIR/proc"
+  sudo mount -t sysfs sysfs "$ROOTFS_DIR/sys"
+
+  sudo chroot "$ROOTFS_DIR" /usr/bin/apt-get update
+  # Package names were validated by the outer script; word splitting is intentional here.
+  sudo chroot "$ROOTFS_DIR" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+    /usr/bin/apt-get install -y --no-install-recommends $PACKAGES
+  sudo chroot "$ROOTFS_DIR" /usr/bin/apt-get clean
+
+  cleanup_package_chroot
+  echo "additional packages installed"
+fi
+
+# With --packages, apt has created real root-owned files. Run the final
+# rootfs modifications and mke2fs as root, but keep fakeroot active so the
+# ownership metadata from the original extraction is preserved in ubuntu.img.
+FAKEROOT_RUN=(fakeroot -i "$FAKEROOT_STATE")
+if [ -n "$PACKAGES" ]; then
+  FAKEROOT_RUN=(sudo "${FAKEROOT_RUN[@]}")
+fi
+"${FAKEROOT_RUN[@]}" -- bash -ec '
+cd stage
 # telephony fix: ofono-binder-plugin (selected via device-info OfonoPlugin) + QTI IMS extension
 install -m 644 ../dl/vayu-binder.conf system/etc/ofono/binder.conf
 grep -q "^  OfonoPlugin:" system/etc/deviceinfo/devices/vayu.yaml || \
@@ -392,7 +600,9 @@ echo "rootfs ${SZ}M"
 truncate -s ${SZ}M ../'"$OUT"'/ubuntu.img
 mkfs.ext4 -F -q -d system ../'"$OUT"'/ubuntu.img
 '
-rm -rf stage
+rm -f -- "$FAKEROOT_STATE"
+trap - EXIT
+remove_stage
 e2fsck -fn $OUT/ubuntu.img >/dev/null
 
 # ---------------------------------------------------------------- assemble kit
@@ -692,7 +902,7 @@ cd images
 # bootloader fastboot
 fastboot flash boot boot.img
 fastboot flash dtbo dtbo.img
-fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img
+fastboot flash vbmeta vbmeta.img
 
 # vendor lives in the dynamic "super" partition -> needs fastbootd
 fastboot reboot fastboot
@@ -726,12 +936,21 @@ See [Hardware support](#hardware-support) for what has been tested.
 A single script downloads and builds **everything** – it also works on its own, outside the kit:
 
 ```bash
-./build/build-2604.sh          # -> ./build/vayu-ubuntu-touch-26.04-flashkit/
-./build/build-2604.sh --pack   # additionally creates the .tar.zst + .sha256
+./build/build-2604.sh                                  # -> ./build/vayu-ubuntu-touch-26.04-flashkit/
+./build/build-2604.sh --pack                           # additionally creates the .tar.zst + .sha256
+./build/build-2604.sh --packages flatpak,xdg-desktop-portal        # install extra packages into ubuntu.img
+./build/build-2604.sh --pack --packages flatpak,xdg-desktop-portal
 ```
 
 Needs `curl wget python3 unzip fakeroot e2fsprogs (mke2fs >= 1.43) xz-utils` (`zstd` for `--pack`)
-and about **16 GB** free disk space. **No root/sudo needed** (fakeroot + `mke2fs -d`).
+and about **16 GB** free disk space. The normal build needs no root/sudo (fakeroot + `mke2fs -d`).
+
+`--packages` accepts a comma- or space-separated list of additional Ubuntu ARM64 package names,
+for example `--packages flatpak,xdg-desktop-portal`. Those packages are installed into the image with `apt-get`
+inside the extracted ARM64 rootfs. This option additionally requires `sudo`, `qemu-aarch64-static`,
+and an enabled `qemu-aarch64` `binfmt_misc` registration with the `F` flag; sudo is used only for
+the chroot and its temporary mounts. Package installation runs `apt-get update` first.
+
 Downloads are cached in `dl/` next to the script, so a second run is much faster.
 
 What it does:

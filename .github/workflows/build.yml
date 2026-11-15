@@ -20,6 +20,10 @@ on:
         description: "Kernel 4.14.221-perf+ selbst bauen (kernel/build-kernel.sh, ~40 min)"
         type: boolean
         default: false
+      additional_packages:
+        description: "packages to be installed into rootfs, separate then with colon (likeflatpak,fastfetch,clang,lldb)"
+        type: string
+        default: ""
   # Tag pushen (git tag v26.04-1 && git push --tags) -> Build + Release
   push:
     tags: ['v*']
@@ -95,7 +99,7 @@ jobs:
       - name: Build kit
         run: |
           chmod +x build-2604.sh
-          ./build-2604.sh --pack 2>&1 | tee build.log
+          ./build-2604.sh --pack 2>&1 --packages ${{ inputs.additional_packages }} | tee build.log
           df -h /
 
       # Release-Assets dürfen max. 2 GiB groß sein -> in Teile splitten
